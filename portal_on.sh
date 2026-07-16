@@ -1,7 +1,6 @@
 #!/bin/bash
 # ============================================================
-# portal_on.sh - Reactiva el portal cautivo con la configuración correcta.
-#                 Pide las interfaces WAN y LAN y las configura.
+# portal_on.sh - Reactiva el portal cautivo con configuración correcta
 # ============================================================
 
 # Colores
@@ -14,39 +13,43 @@ mensaje() { echo -e "${GREEN}[INFO]${NC} $1"; }
 error() { echo -e "${RED}[ERROR]${NC} $1"; exit 1; }
 advertencia() { echo -e "${YELLOW}[WARN]${NC} $1"; }
 
+# Verificar root
 if [[ $EUID -ne 0 ]]; then
-    error "Ejecuta como root: sudo ./portal_on.sh"
+   error "Ejecuta como root: sudo ./portal_on.sh"
 fi
 
-# ---- Selección de interfaces ----
-echo "Interfaces detectadas:"
-ip -o link show | awk -F': ' '{print "  " $2}'
-echo ""
-read -p "Introduce la interfaz WAN (ej. ens33): " WAN_IF
-read -p "Introduce la interfaz LAN (ej. ens34): " LAN_IF
+# Detectar interfaces
+WAN_IF=$(ip route | grep default | awk '{print $5}' | head -1)
+LAN_IF=$(ip -o link show | awk -F': ' '{print $2}' | grep -v lo | grep -v "$WAN_IF" | head -1)
 
-if ! ip link show "$WAN_IF" > /dev/null 2>&1 || ! ip link show "$LAN_IF" > /dev/null 2>&1; then
-    error "Una o ambas interfaces no existen. Verifica."
+if [ -z "$WAN_IF" ] || [ -z "$LAN_IF" ]; then
+    error "No se detectaron WAN/LAN automáticamente. Configura manualmente."
 fi
+mensaje "WAN: $WAN_IF  |  LAN: $LAN_IF"
 
-mensaje "Usando WAN: $WAN_IF  |  LAN: $LAN_IF"
+# Elegir el comando iptables correcto
+if command -v iptables-legacy &>/dev/null; then
+    IPTABLES_CMD="iptables-legacy"
+else
+    IPTABLES_CMD="iptables"
+fi
+mensaje "Usando $IPTABLES_CMD"
 
-# ---- Configurar IP estática en la LAN ----
-mensaje "Configurando IP 192.168.10.1/24 en $LAN_IF..."
-ip addr flush dev $LAN_IF
+# ---- 1. Configurar IP de la LAN ----
+mensaje "Configurando IP 192.168.10.1/24 en $LAN_IF ..."
+ip addr flush dev $LAN_IF 2>/dev/null
 ip addr add 192.168.10.1/24 dev $LAN_IF
 ip link set $LAN_IF up
 
-# ---- Habilitar IP forwarding ----
+# ---- 2. Habilitar IP forwarding ----
 sysctl -w net.ipv4.ip_forward=1
 echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
 
-# ---- Instalar paquetes (por si no están) ----
-mensaje "Asegurando paquetes necesarios..."
+# ---- 3. Instalar paquetes necesarios (por si faltan) ----
 apt update -y
 apt install -y iptables dnsmasq apache2 php libapache2-mod-php at
 
-# ---- Configurar dnsmasq con bloqueos y DHCP ----
+# ---- 4. Configurar dnsmasq (DHCP + DNS + bloqueo) ----
 mensaje "Configurando dnsmasq..."
 cat > /etc/dnsmasq.conf <<EOF
 interface=$LAN_IF
@@ -65,11 +68,11 @@ EOF
 systemctl restart dnsmasq
 systemctl enable dnsmasq
 
-# ---- Configurar Apache y portal ----
+# ---- 5. Configurar Apache + portal ----
 mensaje "Configurando Apache y portal..."
 mkdir -p /var/www/portal
 
-# index.html (página de login)
+# Página de login (index.html)
 cat > /var/www/portal/index.html <<'HTML'
 <!DOCTYPE html>
 <html>
@@ -147,9 +150,8 @@ a2ensite portal.conf
 systemctl restart apache2
 systemctl enable apache2
 
-# ---- Script de autenticación ----
+# ---- 6. Script de autenticación ----
 mensaje "Creando script de autenticación..."
-mkdir -p /usr/local/bin
 cat > /usr/local/bin/portal_allow.sh <<'SCRIPT'
 #!/bin/bash
 CLIENT_IP=$1
@@ -158,63 +160,66 @@ if iptables -L FORWARD -n | grep -q "$CLIENT_IP"; then
     echo "IP $CLIENT_IP ya permitida."
     exit 0
 fi
+# Agregar reglas
 iptables -I FORWARD -s $CLIENT_IP -j ACCEPT
 iptables -t nat -I AUTH_IPS -s $CLIENT_IP -j RETURN
+# Programar expiración (60 min)
 echo "iptables -D FORWARD -s $CLIENT_IP -j ACCEPT" | at now + 60 minutes 2>/dev/null
 echo "iptables -t nat -D AUTH_IPS -s $CLIENT_IP -j RETURN" | at now + 60 minutes 2>/dev/null
 echo "Acceso permitido para $CLIENT_IP por 60 minutos."
 SCRIPT
 chmod +x /usr/local/bin/portal_allow.sh
 
-# ---- Configurar iptables ----
-mensaje "Configurando iptables (portal activo)..."
-iptables -F
-iptables -t nat -F
-iptables -X
+# ---- 7. Configurar iptables ----
+mensaje "Configurando iptables..."
+# Limpiar todo
+$IPTABLES_CMD -F
+$IPTABLES_CMD -t nat -F
+$IPTABLES_CMD -X
 
 # Políticas
-iptables -P INPUT DROP
-iptables -P FORWARD DROP
-iptables -P OUTPUT ACCEPT
+$IPTABLES_CMD -P INPUT DROP
+$IPTABLES_CMD -P FORWARD DROP
+$IPTABLES_CMD -P OUTPUT ACCEPT
 
 # Loopback y estados
-iptables -A INPUT -i lo -j ACCEPT
-iptables -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
-iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+$IPTABLES_CMD -A INPUT -i lo -j ACCEPT
+$IPTABLES_CMD -A INPUT -m state --state ESTABLISHED,RELATED -j ACCEPT
+$IPTABLES_CMD -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
 # Servicios en LAN
-iptables -A INPUT -i $LAN_IF -p udp --dport 67:68 -j ACCEPT
-iptables -A INPUT -i $LAN_IF -p udp --dport 53 -j ACCEPT
-iptables -A INPUT -i $LAN_IF -p tcp --dport 80 -j ACCEPT
-iptables -A INPUT -i $LAN_IF -p icmp -j ACCEPT
-iptables -A INPUT -i $LAN_IF -p tcp --dport 22 -j ACCEPT
+$IPTABLES_CMD -A INPUT -i $LAN_IF -p udp --dport 67:68 -j ACCEPT
+$IPTABLES_CMD -A INPUT -i $LAN_IF -p udp --dport 53 -j ACCEPT
+$IPTABLES_CMD -A INPUT -i $LAN_IF -p tcp --dport 80 -j ACCEPT
+$IPTABLES_CMD -A INPUT -i $LAN_IF -p icmp -j ACCEPT
+$IPTABLES_CMD -A INPUT -i $LAN_IF -p tcp --dport 22 -j ACCEPT   # SSH
 
-# Salida a WAN
-iptables -A OUTPUT -o $WAN_IF -j ACCEPT
-iptables -A INPUT -i $WAN_IF -m state --state ESTABLISHED,RELATED -j ACCEPT
+# Tráfico WAN
+$IPTABLES_CMD -A OUTPUT -o $WAN_IF -j ACCEPT
+$IPTABLES_CMD -A INPUT -i $WAN_IF -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-# NAT
-iptables -t nat -A POSTROUTING -o $WAN_IF -j MASQUERADE
+# NAT (masquerade)
+$IPTABLES_CMD -t nat -A POSTROUTING -o $WAN_IF -j MASQUERADE
 
-# Cadena AUTH_IPS para evitar redirección a IPs autenticadas
-iptables -t nat -N AUTH_IPS
-iptables -t nat -A PREROUTING -i $LAN_IF -j AUTH_IPS
+# Cadena AUTH_IPS para evitar redirección
+$IPTABLES_CMD -t nat -N AUTH_IPS
+$IPTABLES_CMD -t nat -A PREROUTING -i $LAN_IF -j AUTH_IPS
 
-# Redirección al portal (solo para tráfico que no pasó por AUTH_IPS)
-iptables -t nat -A PREROUTING -i $LAN_IF -p tcp --dport 80 -j DNAT --to-destination 192.168.10.1:80
-iptables -t nat -A PREROUTING -i $LAN_IF -p tcp --dport 443 -j DNAT --to-destination 192.168.10.1:80
+# Redirección HTTP/HTTPS al portal
+$IPTABLES_CMD -t nat -A PREROUTING -i $LAN_IF -p tcp --dport 80 -j DNAT --to-destination 192.168.10.1:80
+$IPTABLES_CMD -t nat -A PREROUTING -i $LAN_IF -p tcp --dport 443 -j DNAT --to-destination 192.168.10.1:80
 
 # Guardar reglas
-apt install -y iptables-persistent
-iptables-save > /etc/iptables/rules.v4
+apt install -y iptables-persistent 2>/dev/null
+iptables-save > /etc/iptables/rules.v4 2>/dev/null
 systemctl enable netfilter-persistent 2>/dev/null || systemctl enable iptables-persistent 2>/dev/null
 systemctl restart netfilter-persistent 2>/dev/null || systemctl restart iptables-persistent 2>/dev/null
 
-# ---- Asegurar atd ----
+# ---- 8. Asegurar atd ----
 systemctl enable atd
 systemctl restart atd
 
-# ---- Resumen ----
+# ---- 9. Resumen final ----
 echo "============================================================"
 echo -e "${GREEN}✅ PORTAL CAUTIVO ACTIVADO${NC}"
 echo "============================================================"
@@ -222,6 +227,8 @@ echo "LAN IP: 192.168.10.1/24 en $LAN_IF"
 echo "DHCP: 192.168.10.100 - 192.168.10.200"
 echo "Portal: http://192.168.10.1"
 echo "Credenciales: admin / admin123"
-echo "Bloqueos: instagram.com y chatgpt.com"
 echo "============================================================"
-mensaje "Prueba desde el cliente: renueva IP y abre http://192.168.10.1"
+echo -e "${YELLOW}Prueba desde el cliente:${NC}"
+echo "1. Renueva IP (dhclient o ipconfig /renew)"
+echo "2. Abre http://192.168.10.1 en el navegador"
+echo "============================================================"
